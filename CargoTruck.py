@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
+st.set_page_config(layout='wide')
 
 components.html('''
 <style>
@@ -39,9 +40,92 @@ html, body { overflow: hidden; height: 100%; }
   position: absolute; bottom: 16px; left: 16px; z-index: 20;
   background: rgba(17,24,39,0.85); color: #e5e7eb; padding: 8px 10px; border-radius: 10px; font-size: 13px;
 }
-#legend {
-  position: absolute; bottom: 16px; right: 16px; z-index: 20;
-  background: rgba(255,255,255,0.9); color: #111827; padding: 8px 10px; border-radius: 10px; font-size: 12px;
+#legend { position: absolute; bottom: 16px; right: 16px; z-index: 20; background: rgba(255,255,255,0.9); color: #111827; padding: 8px 10px; border-radius: 10px; font-size: 12px; }
+
+#groupsPanel {
+  position: fixed;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 250px;
+  transition: transform 0.3s;
+  z-index: 10; /* groups behind custom panel */
+}
+
+#toggleGroupsBtn {
+  padding: 10px 12px;
+  border: 1px solid #ddd;
+  border-radius: 0 8px 8px 0;
+  background: white;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+#groupsList {
+  position: relative;
+  left: -260px; /* hidden by default */
+  width: 260px;
+  background: #f9f9f9;
+  border-radius: 0 8px 8px 0;
+  box-shadow: 3px 3px 15px rgba(0,0,0,0.15);
+  overflow-y: auto;
+  max-height: 80vh;
+  padding: 10px;
+  gap: 6px;
+  transition: left 0.3s ease;
+}
+
+#groupsList.show { left: 0; }
+
+.group {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 6px;
+  background: #fff;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.group.dragging {
+  opacity: 0.6;
+  transform: scale(0.995);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+}
+
+.groupHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+.groupHeader .actions button {
+  margin-left: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.groupHeader .actions button.deleteBtn {
+  background: #ff4d4d;
+  color: white;
+  font-weight: bold;
+}
+
+.groupContent {
+  display: none;
+  padding-left: 6px;
+  font-size: 13px;
+}
+
+
+#customboxform {
+  position: fixed;
+  left: 0;
+  top: 10%;
+  width: 250px;
+  transition: transform 0.3s;
+  z-index: 20; /* custom panel above groups */
 }
 </style>
 
@@ -76,7 +160,15 @@ html, body { overflow: hidden; height: 100%; }
   </div>
 
   <div id="statusPanel">Boxes: <span id="countAll">0</span> • Stored in trailer: <span id="countStored">0</span></div>
-  <div id="legend">🟩 stored in trailer • 🔴 hover • 🟡 move arrows (double-click)</div>
+  <div id="legend"></div>
+<div id="groupsPanel">
+  <button id="toggleGroupsBtn">Groups ▸</button>
+  <div id="groupsList">
+    <button id="addGroupBtn">+ Add Group</button>
+    <div id="groupItems"></div>
+  </div>
+</div>
+
 </div>
 
 <script type="module">
@@ -101,11 +193,28 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
 dirLight.position.set(8, 12, 6);
 scene.add(dirLight);
+const floorColliders = [];
+                
+const groups = []; // array of { name, cubes: [] }
+
+const toggleGroupsBtn = document.getElementById('toggleGroupsBtn');
+const groupsList = document.getElementById('groupsList');
+const addGroupBtn = document.getElementById('addGroupBtn');
+const groupItems = document.getElementById('groupItems');
 
 /* Ground */
 const grid = new THREE.GridHelper(30, 30, 0x444444, 0xaaaaaa);
 scene.add(grid);
-
+                
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(30, 30),
+  new THREE.MeshBasicMaterial({ visible: false })
+);
+ground.rotation.x = -Math.PI/2;
+ground.position.y = 0;
+scene.add(ground);
+floorColliders.push(ground);
+                
 /* Globals */
 const YARD_BOUND = 12;
 const MIN = -YARD_BOUND, MAX = YARD_BOUND;
@@ -117,10 +226,14 @@ let hoverObj = null, activeCube = null;
 let dragControls = null;
 let boxCount = 0;
 
-let trailer = null;       // THREE.Group containing the walls/floor/roof
+let trailer = null;
 let trailerVisible = true;
-let trailerInterior = null; // invisible mesh for interior bounds (for Box3)
-let trailerBox = null;    // THREE.Box3 of the interior usable volume
+let trailerInterior = null;
+let trailerBox = null;
+
+// NEW: store invisible wall colliders
+const wallColliders = [];
+
 
 /* Trailer dimensions (inner usable space) */
 const T_W = 6;   // inner width (x)
@@ -146,13 +259,23 @@ function toHex(n){ return ('000000' + n.toString(16)).slice(-6); }
 
 /* Create trailer (hollow, open at the back) */
 function createTrailer() {
-  if (trailer) { scene.remove(trailer); trailer = null; }
+  // Remove previous trailer and its colliders from scene
+  if (trailer) {
+    scene.remove(trailer);
+    trailer = null;
+  }
+  // remove old colliders from scene as well
+  while (wallColliders.length) {
+    const c = wallColliders.pop();
+    if (c && c.parent) c.parent.remove(c);
+  }
+
   trailer = new THREE.Group();
 
   // Base position: place floor on y=0 so boxes roll in on the grid
   const cx = 0, cy = FLOOR_T/2, cz = 0;
 
-  // Floor
+  // === FLOOR ===
   const floor = new THREE.Mesh(
     new THREE.BoxGeometry(T_W + 2*WALL_T, FLOOR_T, T_D + WALL_T),
     new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.1, roughness: 0.8 })
@@ -160,15 +283,36 @@ function createTrailer() {
   floor.position.set(cx, cy, cz);
   trailer.add(floor);
 
-  // Roof
+// Floor collider
+const floorBlocker = new THREE.Mesh(
+  new THREE.BoxGeometry(T_W, FLOOR_T, T_D),
+  new THREE.MeshBasicMaterial({ visible: false })
+);
+floorBlocker.position.set(cx, cy, cz);
+scene.add(floorBlocker);
+
+// ✅ Add to a separate array for floors
+floorColliders.push(floorBlocker);
+
+
+  // === ROOF ===
   const roof = new THREE.Mesh(
     new THREE.BoxGeometry(T_W + 2*WALL_T, WALL_T, T_D + WALL_T),
-    new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.1, roughness: 0.8, transparent: true, opacity: 0.4 })
+    new THREE.MeshStandardMaterial({ color: 0xdddddd, transparent: true, opacity: 0.4 })
   );
   roof.position.set(cx, T_H + FLOOR_T - WALL_T/2, cz);
   trailer.add(roof);
 
-  // Left wall ( -x )
+  // Roof collider
+  const roofBlocker = new THREE.Mesh(
+    new THREE.BoxGeometry(T_W, WALL_T, T_D),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  roofBlocker.position.copy(roof.position);
+  scene.add(roofBlocker);
+  wallColliders.push(roofBlocker);
+
+  // === LEFT WALL ===
   const left = new THREE.Mesh(
     new THREE.BoxGeometry(WALL_T, T_H, T_D + WALL_T),
     new THREE.MeshStandardMaterial({ color: 0xbfc7cf, transparent: true, opacity: 0.4 })
@@ -176,7 +320,16 @@ function createTrailer() {
   left.position.set(cx - (T_W/2 + WALL_T/2), FLOOR_T + T_H/2, cz);
   trailer.add(left);
 
-  // Right wall ( +x )
+  // Left collider
+  const leftBlocker = new THREE.Mesh(
+    new THREE.BoxGeometry(WALL_T, T_H, T_D),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  leftBlocker.position.copy(left.position);
+  scene.add(leftBlocker);
+  wallColliders.push(leftBlocker);
+
+  // === RIGHT WALL ===
   const right = new THREE.Mesh(
     new THREE.BoxGeometry(WALL_T, T_H, T_D + WALL_T),
     new THREE.MeshStandardMaterial({ color: 0xbfc7cf, transparent: true, opacity: 0.4 })
@@ -184,7 +337,16 @@ function createTrailer() {
   right.position.set(cx + (T_W/2 + WALL_T/2), FLOOR_T + T_H/2, cz);
   trailer.add(right);
 
-  // Front wall ( +z ) — closed
+  // Right collider
+  const rightBlocker = new THREE.Mesh(
+    new THREE.BoxGeometry(WALL_T, T_H, T_D),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  rightBlocker.position.copy(right.position);
+  scene.add(rightBlocker);
+  wallColliders.push(rightBlocker);
+
+  // === FRONT WALL ===
   const front = new THREE.Mesh(
     new THREE.BoxGeometry(T_W, T_H, WALL_T),
     new THREE.MeshStandardMaterial({ color: 0xb5c1cd, transparent: true, opacity: 0.85 })
@@ -192,15 +354,22 @@ function createTrailer() {
   front.position.set(cx, FLOOR_T + T_H/2, cz + (T_D/2 + WALL_T/2));
   trailer.add(front);
 
-  // Back is open ( -z ) to allow loading
+  // Front collider
+  const frontBlocker = new THREE.Mesh(
+    new THREE.BoxGeometry(T_W, T_H, WALL_T),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  frontBlocker.position.copy(front.position);
+  scene.add(frontBlocker);
+  wallColliders.push(frontBlocker);
 
-  // Optional edges
+  // === EDGES ===
   const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(T_W + 2*WALL_T, T_H + FLOOR_T + WALL_T, T_D + WALL_T));
   const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x444444 }));
   line.position.set(cx, FLOOR_T + (T_H)/2 - WALL_T/2, cz);
   trailer.add(line);
 
-  // Invisible interior volume mesh (for Box3 containment checks)
+  // Invisible interior volume mesh (for containment checks)
   trailerInterior = new THREE.Mesh(
     new THREE.BoxGeometry(T_W, T_H, T_D),
     new THREE.MeshBasicMaterial({ visible: false })
@@ -208,13 +377,13 @@ function createTrailer() {
   trailerInterior.position.set(cx, FLOOR_T + T_H/2, cz);
   trailer.add(trailerInterior);
 
-  // A small ramp at the open back for visuals
+  // Optional ramp at back
   const rampGeom = new THREE.PlaneGeometry(T_W, 2);
   const rampMat = new THREE.MeshStandardMaterial({ color: 0x999999, side: THREE.DoubleSide });
   const ramp = new THREE.Mesh(rampGeom, rampMat);
   ramp.rotation.x = -Math.PI/6;
   ramp.position.set(cx, FLOOR_T/2, cz - (T_D/2 + 0.8));
-  //trailer.add(ramp);
+  // trailer.add(ramp);
 
   scene.add(trailer);
 
@@ -222,8 +391,48 @@ function createTrailer() {
   trailerBox = new THREE.Box3().setFromObject(trailerInterior);
 }
 
+
 createTrailer();
 
+function resolveCollision(cube) {
+  const cubeBox = new THREE.Box3().setFromObject(cube);
+
+  // Check against wall colliders
+  for (let collider of wallColliders) {
+    const wallBox = new THREE.Box3().setFromObject(collider);
+    if (cubeBox.intersectsBox(wallBox)) {
+      const cubeSize = cube.geometry.parameters;
+      const halfSize = {
+        x: cubeSize.width / 2,
+        y: cubeSize.height / 2,
+        z: cubeSize.depth / 2
+      };
+
+      // Compute overlap amounts in each axis
+      const dx1 = wallBox.max.x - cubeBox.min.x;
+      const dx2 = cubeBox.max.x - wallBox.min.x;
+      const dy1 = wallBox.max.y - cubeBox.min.y;
+      const dy2 = cubeBox.max.y - wallBox.min.y;
+      const dz1 = wallBox.max.z - cubeBox.min.z;
+      const dz2 = cubeBox.max.z - wallBox.min.z;
+
+      // Find the smallest overlap (minimum push-out distance)
+      const minOverlap = Math.min(dx1, dx2, dy1, dy2, dz1, dz2);
+
+      if (minOverlap === dx1) cube.position.x += dx1;
+      else if (minOverlap === dx2) cube.position.x -= dx2;
+      else if (minOverlap === dy1) cube.position.y += dy1;
+      else if (minOverlap === dy2) cube.position.y -= dy2;
+      else if (minOverlap === dz1) cube.position.z += dz1;
+      else if (minOverlap === dz2) cube.position.z -= dz2;
+
+      // Recalculate cubeBox after pushing
+      cubeBox.setFromObject(cube);
+    }
+  }
+}
+
+                
 /* Drag system refresh */
 function refreshDragControls() {
   if (dragControls) dragControls.dispose();
@@ -241,32 +450,165 @@ function refreshDragControls() {
     elForm.style.display = 'none';
     e.object.userData.prevPos = e.object.position.clone();
   });
+                
+// Move cube from prevPos toward targetPos in small steps to avoid tunneling.
+// Only XZ movement; Y is locked to cube half-height.
+function moveWithSweep(cube, targetPos) {
+  scene.updateMatrixWorld(true);
 
-  dragControls.addEventListener('drag', e => {
-    const o = e.object;
-    // Keep on ground by default
-    o.position.y = Math.max(o.geometry.parameters.height / 2, o.position.y);
+  const prev = cube.userData.prevPos ? cube.userData.prevPos.clone() : cube.position.clone();
+  const delta = new THREE.Vector3(
+    targetPos.x - prev.x,
+    0, // Y handled separately
+    targetPos.z - prev.z
+  );
 
-    // If currently inside trailer, clamp inside; else clamp to yard
-    if (isInsideTrailerByPos(o)) {
-      clampInsideTrailer(o);
-    } else {
-      clampYard(o);
+  const dist = delta.length();
+  if (dist === 0) {
+    cube.position.copy(prev);
+    cube.userData.prevPos = prev.clone();
+    return true;
+  }
+
+  const geom = cube.geometry.parameters;
+  const smallestDim = Math.min(geom.width || geom.w || 1, geom.height || geom.h || 1, geom.depth || geom.d || 1);
+  const stepSize = Math.min(0.25, Math.max(0.08, smallestDim * 0.25));
+  const steps = Math.max(1, Math.ceil(dist / stepSize));
+
+  const step = delta.clone().divideScalar(steps);
+  let cur = prev.clone();
+
+  // We'll need world trailer center for opening tests; compute once per call (cheap)
+  let trailerWorldCenter = null;
+  if (trailerInterior) {
+    trailerInterior.updateWorldMatrix(true, false);
+    trailerWorldCenter = new THREE.Vector3();
+    trailerInterior.getWorldPosition(trailerWorldCenter);
+  }
+
+  for (let i = 1; i <= steps; i++) {
+    cur.add(step);
+    cube.position.x = cur.x;
+    cube.position.z = cur.z;
+
+    // half extents
+    const halfH = (geom.height || geom.h || 1) / 2;
+    const halfD = (geom.depth || geom.d || geom.width || 1) / 2;
+
+    // --- Opening intersection test (robust) ---
+    let isTouchingOpening = false;
+    if (trailerWorldCenter) {
+      // back opening plane z (open side) is trailerWorldCenter.z - T_D/2 (your trailer was open on negative Z)
+      const backZ = trailerWorldCenter.z - (T_D / 2);
+
+      // create a thin opening slab centered at backZ
+      const OPEN_THICKNESS = 0.22; // small thickness to catch overlaps (tweak if needed)
+      const openingMin = new THREE.Vector3(
+        trailerWorldCenter.x - T_W / 2,
+        trailerWorldCenter.y - T_H / 2,
+        backZ - OPEN_THICKNESS / 2
+      );
+      const openingMax = new THREE.Vector3(
+        trailerWorldCenter.x + T_W / 2,
+        trailerWorldCenter.y + T_H / 2,
+        backZ + OPEN_THICKNESS / 2
+      );
+      const openingBox = new THREE.Box3(openingMin, openingMax);
+
+      // compute cube AABB in world coords
+      const cubeBox = new THREE.Box3().setFromObject(cube);
+
+      // motion direction: are we moving into the trailer (toward negative Z)?
+      const movingInto = (prev.z - cur.z) > 0.0001; // true if z decreases this step
+
+      // touch if AABB intersects the opening slab and we are moving into the trailer
+      if (cubeBox.intersectsBox(openingBox) && movingInto) {
+        isTouchingOpening = true;
+      }
     }
 
-    // Prevent overlapping with other cubes
-    if (detectCollision(o)) {
-      // revert to previous position
-      o.position.copy(o.userData.prevPos);
+    // --- If touching opening while moving in, snap to trailer floor ---
+    if (isTouchingOpening) {
+      const floorY = FLOOR_T;            // trailer floor top surface y
+      cube.position.y = floorY + halfH;
     } else {
-      o.userData.prevPos.copy(o.position);
-    }
-  });
+      // --- Normal downward raycast to floors/platforms/other cubes ---
+      const rayOrigin = cube.position.clone();
+      // start higher so tall cubes / edge cases are covered
+      rayOrigin.y += Math.max(2, halfH + 0.5);
+      const downRay = new THREE.Raycaster(rayOrigin, new THREE.Vector3(0, -1, 0));
 
-  dragControls.addEventListener('dragend', e => {
-    orbit.enabled = true;
-    updateStoredState(e.object);
-  });
+      const surfaces = floorColliders.concat(cubes.filter(c => c !== cube));
+      const intersects = downRay.intersectObjects(surfaces, true);
+
+      if (intersects.length > 0) {
+        // use highest hit under the cube
+        let maxY = -Infinity;
+        intersects.forEach(hit => { if (hit.point.y > maxY) maxY = hit.point.y; });
+        cube.position.y = maxY + halfH;
+      } else {
+        // fallback to yard ground
+        cube.position.y = halfH;
+      }
+    }
+
+    // --- Clamp inside trailer or yard ---
+    if (trailerVisible && trailerInterior && isInsideTrailerByPos(cube)) clampInsideTrailer(cube);
+    else clampYard(cube);
+
+    // --- Collision detection: revert if blocked ---
+    if (detectCollision(cube)) {
+      cube.position.copy(prev);
+      return false;
+    }
+  }
+
+  // movement accepted
+  cube.userData.prevPos = cube.position.clone();
+  return true;
+}
+
+dragControls.addEventListener('drag', e => {
+  const cube = e.object;
+  const targetPos = cube.position.clone();
+
+  // move in X/Z using existing sweep (this also sets Y via raycast fallback)
+  moveWithSweep(cube, targetPos);
+
+  // half height of cube
+  const halfH = (cube.geometry.parameters.height || cube.geometry.parameters.h || 1) / 2;
+
+  // If near the trailer opening, snap up to trailer floor; otherwise return to grid level
+  const NEAR_THRESH = 0.8; // tweak this: bigger => detect earlier
+  if (trailerVisible && isNearOpening(cube, NEAR_THRESH)) {
+    // trailer floor top is at y = FLOOR_T
+    cube.position.y = FLOOR_T + halfH;
+  } else {
+    // outside -> grid level
+    cube.position.y = halfH;
+  }
+
+  // clamp and collisions
+  if (trailerVisible && isInsideTrailerByPos(cube)) clampInsideTrailer(cube);
+  else clampYard(cube);
+
+  if (detectCollision(cube)) {
+    cube.position.copy(cube.userData.prevPos);
+  }
+});
+
+
+
+ dragControls.addEventListener('dragend', e => {
+   try {
+     updateStoredState(e.object);
+   } catch (err) {
+     console.error('dragend handler error:', err);
+   } finally {
+     orbit.enabled = true;
+   }
+ });
+
 }
 
 /* Yard clamp (global bounds) */
@@ -317,29 +659,81 @@ function isInsideTrailerByPos(obj) {
   return trailerBox.containsPoint(p);
 }
 
+// is the cube near the trailer opening (back side)? threshold in world units
+function isNearOpening(cube, threshold = 0.6) {
+  if (!trailerInterior) return false;
+
+  // get trailer interior world center
+  trailerInterior.updateWorldMatrix(true, false);
+  const worldCenter = new THREE.Vector3();
+  trailerInterior.getWorldPosition(worldCenter);
+
+  // open side is at backZ (negative z in your setup)
+  const backZ = worldCenter.z - (T_D / 2);
+
+  // cube center in world coords
+  const cubeCenter = new THREE.Vector3();
+  cube.getWorldPosition(cubeCenter);
+
+  // check X within trailer width (with small margin)
+  const halfW = T_W / 2;
+  const withinX = cubeCenter.x >= (worldCenter.x - halfW - 0.001) && cubeCenter.x <= (worldCenter.x + halfW + 0.001);
+
+  // optionally check vertical overlap — but we just use X+Z test
+  const dz = Math.abs(cubeCenter.z - backZ);
+
+  return withinX && dz <= threshold;
+}
+
+                
 /* Update stored state visuals + flag */
 function updateStoredState(obj) {
   const nowInside = isInsideTrailer(obj);
   obj.userData.inTrailer = nowInside;
 
-  const storedColor = 0x00aa00; // green
-  const normalColor = obj.userData.baseColor || 0xffffff;
-
-  obj.material.forEach(m => m.color.setHex(nowInside ? storedColor : normalColor));
-
-  setCounts();
-  refreshDragControls(); // update draggables if "lock when stored" is checked
+ let hex = obj.userData.baseColor || 0xffffff;
+ if (obj.userData.groupId !== undefined) {
+   const group = groups.find(g => g.id === obj.userData.groupId);
+   if (group) {
+     const col = group.color && group.color.isColor
+       ? group.color
+       : new THREE.Color(group.color || 0xffffff);
+     hex = col.getHex();
+   }
+ }
+ obj.material.forEach(m => m.color.setHex(hex));
+ setCounts();
+ // rebuild after the event loop to avoid interfering with DragControls internals
+ setTimeout(refreshDragControls, 0);
 }
 
 /* Collision with other cubes */
 function detectCollision(cube) {
+  // ensure world matrices are up-to-date (important when objects move)
+  scene.updateMatrixWorld(true);
+
   const a = new THREE.Box3().setFromObject(cube);
-  return cubes.some(other => {
+
+  // Check cube–cube collisions
+  const collideCubes = cubes.some(other => {
     if (other === cube) return false;
     const b = new THREE.Box3().setFromObject(other);
     return a.intersectsBox(b);
   });
+
+  // Check cube–wall collisions, but IGNORE floor-like colliders
+  const collideWalls = wallColliders
+    .filter(collider => !floorColliders.includes(collider)) // <-- ignore floors
+    .some(collider => {
+      const b = new THREE.Box3().setFromObject(collider);
+      return a.intersectsBox(b);
+    });
+
+  return collideCubes || collideWalls;
 }
+
+
+
 
 /* Arrows */
 function clearArrows() { arrows.forEach(a=>scene.remove(a)); arrows.length=0; }
@@ -349,7 +743,12 @@ function clearActiveCube(){ clearArrows(); activeCube=null; elDelete.style.displ
 window.addEventListener('mousemove', e=>{
   mouse.x=(e.clientX/window.innerWidth)*2-1;
   mouse.y=-(e.clientY/window.innerHeight)*2+1;
-  if(hoverObj){ hoverObj.material.forEach(mat => mat.color.setHex(hoverObj.userData.inTrailer ? 0x00aa00 : (hoverObj.userData.baseColor || 0xffffff))); hoverObj=null; }
+  if(hoverObj){ hoverObj.material.forEach(mat => {
+  let hex = hoverObj.userData.groupId !== undefined 
+              ? groups.find(g => g.id === hoverObj.userData.groupId).color.getHex() 
+              : hoverObj.userData.baseColor || 0xffffff;
+  mat.color.setHex(hex);
+}); hoverObj=null; }
   raycaster.setFromCamera(mouse,camera);
   const hits = raycaster.intersectObjects(cubes,false);
   if(hits.length>0){ hoverObj=hits[0].object; hoverObj.material.forEach(mat => mat.color.set(0xff0000)); }
@@ -367,17 +766,503 @@ renderer.domElement.addEventListener('dblclick', e=>{
     const btn=elDelete;
     btn.style.display='block';
     btn.onclick=()=>{
-      clearArrows();
-      scene.remove(activeCube);
-      const idx = cubes.indexOf(activeCube);
-      if (idx>=0) cubes.splice(idx,1);
-      activeCube=null;
-      btn.style.display='none';
+clearArrows();
+
+      // if the active cube belonged to a group, remove it from that group UI/state first
+      if (activeCube && activeCube.userData && activeCube.userData.groupId !== undefined) {
+        // clean up group membership & UI
+        removeCubeFromGroup(activeCube);
+      }
+
+      // remove from scene & global cubes array
+      if (activeCube && activeCube.parent) scene.remove(activeCube);
+      const idx = activeCube ? cubes.indexOf(activeCube) : -1;
+      if (idx >= 0) cubes.splice(idx, 1);
+
+      activeCube = null;
+      btn.style.display = 'none';
       setCounts();
       refreshDragControls();
+      
     }
   }
+  orbit.enabled = true;
 });
+                
+toggleGroupsBtn.addEventListener('click', () => {
+  groupsList.classList.toggle('show');
+});
+
+addGroupBtn.addEventListener('click', () => {
+  const name = prompt("Group name:", "New Group");
+  if (!name) return;
+  addGroup(name);
+});
+function updateLegend() {
+  const legendEl = document.getElementById('legend');
+  legendEl.innerHTML = ''; // clear
+
+  groups.forEach(g => {
+    const count = g.cubes.length;
+    const item = document.createElement('div');
+    item.style.display = 'flex';
+    item.style.alignItems = 'center';
+    item.style.marginBottom = '4px';
+
+    const colorBox = document.createElement('span');
+    colorBox.style.display = 'inline-block';
+    colorBox.style.width = '14px';
+    colorBox.style.height = '14px';
+    colorBox.style.background = '#' + g.color.getHexString();
+    colorBox.style.marginRight = '6px';
+    colorBox.style.borderRadius = '3px';
+
+    const text = document.createElement('span');
+    text.textContent = `${g.name} (${count})`;
+    text.style.fontSize = '12px';
+
+    item.appendChild(colorBox);
+    item.appendChild(text);
+    legendEl.appendChild(item);
+  });
+}
+
+/* Helper: set visibility for all cubes in a group */
+/* small helper: SVG eye / eye-off icons as HTML strings */
+function eyeIconHtml(visible) {
+  if (visible) {
+    // eye (visible)
+    return `
+      <svg class="eyeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>`;
+  } else {
+    // eye-off (hidden)
+    return `
+      <svg class="eyeOffIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a22.9 22.9 0 0 1 5.58-6.22" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M1 1l22 22" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>`;
+  }
+}
+
+/* Helper: set visibility for all cubes in a group (updates icon too) */
+function setGroupVisibility(group, visible) {
+  group.visible = visible;
+  group.cubes = group.cubes.filter(c => c && c.parent);
+
+  // set each cube's visibility and update its per-list eye button if present
+  group.cubes.forEach(c => {
+    c.visible = visible;
+
+    // update cube's group list item eye button (if exists)
+    const item = c.userData.groupListItem;
+    if (item) {
+      const eyeBtn = item.querySelector('.cubeEyeBtn');
+      if (eyeBtn) {
+        eyeBtn.innerHTML = eyeIconHtml(Boolean(c.visible));
+        eyeBtn.title = c.visible ? 'Hide cube' : 'Show cube';
+      }
+    }
+  });
+
+  // Update the group's toggle button icon & tooltip if present
+  if (group.element) {
+    const btn = group.element.querySelector('.toggleVisibleBtn');
+    if (btn) {
+      btn.innerHTML = eyeIconHtml(visible);
+      btn.title = visible ? 'Hide group' : 'Show group';
+      btn.setAttribute('aria-pressed', String(!visible));
+    }
+  }
+}
+
+
+/* Replacement addGroup function: creates per-group eye icon button */
+/* small helper: plus SVG icon */
+function plusIconHtml() {
+  return `
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+}
+
+// call to rebuild the `groups` array to match the DOM order in #groupItems
+function reorderGroupsFromDOM() {
+  // collect group DOM nodes in current order
+  const domList = Array.from(groupItems.children);
+  const newOrder = [];
+
+  domList.forEach((div, idx) => {
+    const oldId = parseInt(div.dataset.id, 10);
+    const groupObj = groups.find(g => g.id === oldId);
+    if (groupObj) {
+      // update dataset id and group's id to reflect new position
+      div.dataset.id = idx;
+      groupObj.id = idx;
+      newOrder.push(groupObj);
+    }
+  });
+
+  // replace groups array contents
+  groups.length = 0;
+  newOrder.forEach(g => groups.push(g));
+
+  // update legend and drag controls so order changes are visible in UI
+  updateLegend();
+  setTimeout(refreshDragControls, 0);
+}
+// create a list item in a group's cubeList with eye + remove controls
+function createCubeListItem(group, cube, cubeList) {
+  // wrapper
+  const item = document.createElement('div');
+  item.style.display = 'flex';
+  item.style.alignItems = 'center';
+  item.style.justifyContent = 'space-between';
+  item.style.gap = '8px';
+  item.style.padding = '4px 0';
+
+  // label (cube name/text)
+  const label = document.createElement('span');
+  label.style.fontSize = '13px';
+  label.textContent = cube.userData.texts && cube.userData.texts[0]
+    ? cube.userData.texts[0]
+    : `Box ${cubes.indexOf(cube) + 1}`;
+
+  // controls container
+  const controls = document.createElement('div');
+  controls.style.display = 'flex';
+  controls.style.gap = '6px';
+  controls.style.alignItems = 'center';
+
+  // eye button
+  const eyeBtn = document.createElement('button');
+  eyeBtn.className = 'cubeEyeBtn';
+  eyeBtn.type = 'button';
+  eyeBtn.innerHTML = eyeIconHtml(Boolean(cube.visible));
+  eyeBtn.title = cube.visible ? 'Hide cube' : 'Show cube';
+  eyeBtn.style.border = 'none';
+  eyeBtn.style.background = 'transparent';
+  eyeBtn.style.cursor = 'pointer';
+  eyeBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    // toggle visibility
+    cube.visible = !cube.visible;
+    eyeBtn.innerHTML = eyeIconHtml(Boolean(cube.visible));
+    eyeBtn.title = cube.visible ? 'Hide cube' : 'Show cube';
+  });
+
+  // remove/unassign button (small 'x' or trash)
+  const removeBtn = document.createElement('button');
+  removeBtn.className = 'cubeRemoveBtn';
+  removeBtn.type = 'button';
+  removeBtn.title = 'Remove from group';
+  removeBtn.textContent = '✖';
+  removeBtn.style.border = 'none';
+  removeBtn.style.background = 'transparent';
+  removeBtn.style.cursor = 'pointer';
+  removeBtn.style.fontSize = '14px';
+  removeBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+
+    // use helper: remove cube from its group and clean up UI
+    removeCubeFromGroup(cube);
+  });
+
+  controls.appendChild(eyeBtn);
+  controls.appendChild(removeBtn);
+
+  item.appendChild(label);
+  item.appendChild(controls);
+  cubeList.appendChild(item);
+
+  // keep a reference so other code can update/remove the DOM item
+  cube.userData.groupListItem = item;
+
+  return item;
+}
+
+// remove cube from whatever group it belongs to (cleans UI + state)
+function removeCubeFromGroup(cube) {
+  if (!cube || cube.userData.groupId === undefined) return;
+
+  const gid = cube.userData.groupId;
+  const group = groups.find(g => g.id === gid);
+  if (!group) {
+    delete cube.userData.groupId;
+    return;
+  }
+
+  // remove from group's cubes array
+  group.cubes = group.cubes.filter(c => c !== cube);
+
+  // remove list item DOM if present
+  if (cube.userData.groupListItem) {
+    try { cube.userData.groupListItem.remove(); } catch (e) { /* ignore */ }
+    cube.userData.groupListItem = null;
+  }
+
+  // restore cube color to its base color (if present)
+  const baseHex = cube.userData.baseColor || 0xffffff;
+  setCubeColorMaterials(cube, '#' + ('000000' + baseHex.toString(16)).slice(-6));
+
+  // make the cube visible (groups control visibility; leaving visible is safer)
+  cube.visible = true;
+
+  // clear assignment
+  delete cube.userData.groupId;
+
+  // update UI
+  setCounts();
+  updateLegend();
+  setTimeout(refreshDragControls, 0);
+}
+
+/* Replacement addGroup: plus icon button that appears after one click (expand) and is bottom-right */
+function addGroup(name) {
+  const colorInputValue = "#ffcc00";
+  const color = new THREE.Color(colorInputValue);
+
+  const groupId = groups.length;
+  const groupDiv = document.createElement('div');
+  groupDiv.classList.add('group');
+  groupDiv.dataset.id = groupId;
+
+  // make groupDiv positioned so the bottom-right plus can be absolute inside it
+  groupDiv.style.position = 'relative';
+  groupDiv.style.paddingBottom = '44px'; // reserve space for the bottom-right button
+
+  groupDiv.innerHTML = `
+    <div class="groupHeader" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+      <input type="color" class="groupColor" value="${colorInputValue}" title="Group color">
+      <span class="groupName">${name}</span>
+      <div class="actions" style="margin-left:auto; display:flex; gap:6px; align-items:center;">
+        <button class="toggleVisibleBtn" title="Hide group" aria-pressed="false">${eyeIconHtml(true)}</button>
+        <button class="renameBtn" title="Rename group">✏️</button>
+        <button class="deleteBtn" title="Delete group">🗑️</button>
+      </div>
+    </div>
+    <div class="groupContent" style="display:none; padding:8px 8px 36px 8px;">
+      <div class="cubeList"></div>
+    </div>
+  `;
+
+  groupItems.appendChild(groupDiv);
+    // Make group draggable and add drag handlers
+  groupDiv.draggable = true;
+
+  groupDiv.addEventListener('dragstart', (ev) => {
+    ev.stopPropagation();
+    groupDiv.classList.add('dragging');
+    // store the group's dataset id so we can find it later
+    ev.dataTransfer.setData('text/plain', groupDiv.dataset.id);
+    ev.dataTransfer.effectAllowed = 'move';
+  });
+
+  groupDiv.addEventListener('dragend', (ev) => {
+    ev.stopPropagation();
+    groupDiv.classList.remove('dragging');
+    // DOM was rearranged during dragover/drop; sync groups array
+    reorderGroupsFromDOM();
+  });
+
+  // Allow dropping between group items: on dragover we insert the dragged element
+  groupDiv.addEventListener('dragover', (ev) => {
+    ev.preventDefault(); // allow drop
+    ev.dataTransfer.dropEffect = 'move';
+    const draggingEl = document.querySelector('.group.dragging');
+    if (!draggingEl || draggingEl === groupDiv) return;
+
+    // compute where to insert: before or after target depending on pointer
+    const rect = groupDiv.getBoundingClientRect();
+    const midY = rect.top + rect.height / 2;
+    const parent = groupDiv.parentElement;
+
+    if (ev.clientY < midY) {
+      // insert before target
+      parent.insertBefore(draggingEl, groupDiv);
+    } else {
+      // insert after target
+      parent.insertBefore(draggingEl, groupDiv.nextSibling);
+    }
+  });
+
+  // optional: support drop (some browsers need drop handler)
+  groupDiv.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const draggingEl = document.querySelector('.group.dragging');
+    if (!draggingEl) return;
+    // ensure final position (dragover already handled visual insertion)
+    reorderGroupsFromDOM();
+  });
+
+  const groupObj = { id: groupId, name, color, cubes: [], element: groupDiv, visible: true };
+  groups.push(groupObj);
+
+  const header = groupDiv.querySelector('.groupHeader');
+  const content = groupDiv.querySelector('.groupContent');
+  const cubeList = content.querySelector('.cubeList');
+  const colorInputEl = groupDiv.querySelector('.groupColor');
+  const toggleVisibleBtn = groupDiv.querySelector('.toggleVisibleBtn');
+
+  // create the bottom-right plus icon button (initially hidden)
+  const addBtn = document.createElement('button');
+  addBtn.className = 'addCubeBtnIcon';
+  addBtn.type = 'button';
+  addBtn.title = 'Add cube to group';
+  addBtn.innerHTML = plusIconHtml();
+  // style it (you can tweak styles)
+  addBtn.style.position = 'absolute';
+  addBtn.style.bottom = '8px';
+  addBtn.style.right = '8px';
+  addBtn.style.width = '36px';
+  addBtn.style.height = '36px';
+  addBtn.style.borderRadius = '8px';
+  addBtn.style.border = '1px solid #ddd';
+  addBtn.style.background = 'white';
+  addBtn.style.display = 'none'; // hidden until the group is expanded
+  addBtn.style.cursor = 'pointer';
+  addBtn.style.boxShadow = '0 4px 10px rgba(0,0,0,0.08)';
+  addBtn.style.alignItems = 'center';
+  addBtn.style.justifyContent = 'center';
+  addBtn.style.padding = '6px';
+  addBtn.style.lineHeight = '0';
+  // ensure icon inherits color
+  addBtn.querySelectorAll('svg').forEach(s => s.style.color = '#111');
+
+  groupDiv.appendChild(addBtn);
+
+  // header click toggles expand/collapse and also shows/hides the plus button
+  header.addEventListener('click', e => {
+    // ignore clicks on the color input or header buttons themselves
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.closest('.actions')) return;
+
+    // toggle content
+    const nowVisible = content.style.display !== 'block';
+    // collapse other groups (same behavior you had before)
+    document.querySelectorAll('.groupContent').forEach(c => {
+      if (c !== content) {
+        c.style.display = 'none';
+        // hide their add buttons if present
+        const p = c.parentElement;
+        if (p) {
+          const otherAdd = p.querySelector('.addCubeBtnIcon');
+          if (otherAdd) otherAdd.style.display = 'none';
+        }
+      }
+    });
+
+    content.style.display = nowVisible ? 'block' : 'none';
+
+    // show/hide this group's plus button accordingly (only when content is open)
+    addBtn.style.display = nowVisible ? 'flex' : 'none';
+  });
+
+  groupDiv.querySelector('.renameBtn').addEventListener('click', e => {
+    e.stopPropagation();
+    const newName = prompt("Rename group:", name);
+    if (newName) {
+      if (groups.some(g => g.name === newName)) { alert("Group name exists!"); return; }
+      groupDiv.querySelector('.groupName').textContent = newName;
+      const group = groups.find(g => g.id === groupId);
+      if (group) group.name = newName;
+      updateLegend();
+    }
+  });
+
+  groupDiv.querySelector('.deleteBtn').addEventListener('click', e => {
+    e.stopPropagation();
+    if (confirm(`Delete group "${name}"?`)) {
+      const group = groups.find(g => g.id === groupId);
+      if (group) {
+        group.cubes.forEach(c => {
+          if (!c) return;
+          const baseHex = c.userData.baseColor || 0xffffff;
+          setCubeColorMaterials(c, '#' + ('000000' + baseHex.toString(16)).slice(-6));
+          delete c.userData.groupId;
+          c.visible = true;
+        });
+      }
+      groupDiv.remove();
+      groups.splice(groups.findIndex(g => g.id === groupId), 1);
+      refreshDragControls();
+      updateLegend();
+    }
+  });
+
+  colorInputEl.addEventListener('input', (ev) => {
+    const val = ev.target.value;
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+    group.color = new THREE.Color(val);
+    group.cubes = group.cubes.filter(c => c && c.parent);
+    group.cubes.forEach(c => {
+      setCubeColorMaterials(c, val);
+      c.userData.baseColor = parseInt(val.replace('#',''), 16);
+      c.visible = (group.visible !== false);
+    });
+    setCounts();
+    setTimeout(refreshDragControls, 0);
+    updateLegend();
+  });
+
+  // show/hide button (eye icon) kept as before
+  toggleVisibleBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+    setGroupVisibility(group, !group.visible);
+  });
+
+  // clicking the plus icon: same add-cube behavior as before
+  addBtn.addEventListener('click', e => {
+    e.stopPropagation(); // avoid toggling the collapse when clicking the plus
+    if (!activeCube) { alert("Double-click a cube first!"); return; }
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+
+    if (activeCube.userData.groupId === groupId) {
+      alert('Cube already in this group.');
+      return;
+    }
+
+    if (activeCube.userData.groupId !== undefined) {
+      const prevG = groups.find(g => g.id === activeCube.userData.groupId);
+      if (prevG) prevG.cubes = prevG.cubes.filter(x => x !== activeCube);
+    }
+
+    clearArrows();
+
+    activeCube.userData.groupId = groupId;
+    group.cubes.push(activeCube);
+
+    const colorHex = '#' + group.color.getHexString();
+    setCubeColorMaterials(activeCube, colorHex);
+
+    // match group's visibility
+    activeCube.visible = (group.visible !== false);
+
+    updateLegend();
+
+    activeCube.userData.baseColor = parseInt(colorHex.replace('#',''), 16);
+
+    // Add cube to group's UI list with controls
+    createCubeListItem(group, activeCube, cubeList);
+
+
+    updateStoredState(activeCube);
+
+    orbit.enabled = true;
+    activeCube = null;
+    elDelete.style.display = 'none';
+    setTimeout(refreshDragControls, 0);
+  });
+
+}
+
+
 
 /* Arrow helpers (XZ move by 1 unit) */
 renderer.domElement.addEventListener('click', e=>{
@@ -471,6 +1356,65 @@ function createCubeFaceTextures(texts, faceColor=null, width=256, height=256, cu
   }
   return materials;
 }
+        
+// safely replace a cube's materials with new face textures and dispose old maps
+function setCubeColorMaterials(cube, hexColor) {
+  // dispose old materials & textures to avoid memory leaks
+  const oldMats = Array.isArray(cube.material) ? cube.material : [cube.material];
+  oldMats.forEach(m => {
+    if (!m) return;
+    if (m.map) { m.map.dispose(); m.map = null; }
+    try { m.dispose(); } catch(e) {}
+  });
+
+  // geometry dims
+  const geom = cube.geometry.parameters || {};
+  const dims = { w: geom.width || geom.w || 1, h: geom.height || geom.h || 1, d: geom.depth || geom.d || 1 };
+  const texts = cube.userData.texts || Array(6).fill('');
+
+  // create new materials using same face texts but new color
+  const newMats = createCubeFaceTextures(texts, hexColor, 256, 256, dims);
+
+  cube.material = newMats;
+  // ensure Three updates
+  cube.material.forEach(m => m.needsUpdate = true);
+}
+                
+
+function getRandomSpawnPositionOutsideTrailer(cubeSize) {
+  const attempts = 100;
+  let pos = new THREE.Vector3();
+
+  for (let i = 0; i < attempts; i++) {
+    // random X/Z in a larger area (bigger than the yard bounds)
+    pos.x = (Math.random() - 0.5) * 30;
+    pos.z = (Math.random() - 0.5) * 30;
+    pos.y = cubeSize.height / 2; // sit on ground
+
+    // ensure outside trailer
+    if (trailerBox) {
+      const cubeBox = new THREE.Box3().setFromCenterAndSize(
+        pos,
+        new THREE.Vector3(cubeSize.width, cubeSize.height, cubeSize.depth)
+      );
+      if (cubeBox.intersectsBox(trailerBox)) continue; // retry
+    }
+
+    // ensure no collision with existing cubes
+    const collide = cubes.some(c => {
+      const b = new THREE.Box3().setFromObject(c);
+      const testBox = new THREE.Box3().setFromCenterAndSize(
+        pos,
+        new THREE.Vector3(cubeSize.width, cubeSize.height, cubeSize.depth)
+      );
+      return testBox.intersectsBox(b);
+    });
+    if (!collide) return pos; // valid position
+  }
+
+  // fallback: center if can't find empty spot
+  return new THREE.Vector3(0, cubeSize.height / 2, 0);
+}
 
 /* Add a random 1x1x1 box (non-overlapping) */
 function addBox(){
@@ -479,25 +1423,18 @@ function addBox(){
   boxCount++;
   const size = 1;
   let cube = null;
-  let tries = 0;
   const texts = Array(6).fill(`Box ${boxCount}`);
 
-  do {
-    cube = new THREE.Mesh(
-      new THREE.BoxGeometry(size,size,size),
-      createCubeFaceTextures(texts, null, 256, 256, {w:size,h:size,d:size})
-    );
-    cube.userData = {
-      baseColor: 0xffffff,
-      prevPos: new THREE.Vector3(),
-      inTrailer: false
-    };
-    // spawn outside trailer by default
-    cube.position.set((Math.random()-0.5)*16, size/2, (Math.random()-0.5)*16);
-    clampYard(cube);
-    tries++;
-    if (tries > 80) break;
-  } while (detectCollision(cube));
+  cube = new THREE.Mesh(
+    new THREE.BoxGeometry(size, size, size),
+    createCubeFaceTextures(texts, null, 256, 256, {w:size,h:size,d:size})
+  );
+  cube.userData = { baseColor: 0xffffff, prevPos: new THREE.Vector3(), inTrailer: false };
+  cube.userData.texts = texts;
+
+  // spawn outside trailer & avoid overlapping
+  const cubeSize = {width: size, height: size, depth: size};
+  cube.position.copy(getRandomSpawnPositionOutsideTrailer(cubeSize));
 
   scene.add(cube);
   cubes.push(cube);
@@ -523,23 +1460,17 @@ document.getElementById('createCustomBox').addEventListener('click', ()=>{
 
   clearActiveCube();
 
-  let cube = null;
-  let tries = 0;
-  do {
-    cube = new THREE.Mesh(
-      new THREE.BoxGeometry(w,h,d),
-      createCubeFaceTextures(Array(6).fill(text), color, 256, 256, {w,h,d})
-    );
-    cube.userData = {
-      baseColor: parseInt(color.replace('#',''),16),
-      prevPos: new THREE.Vector3(),
-      inTrailer: false
-    };
-    cube.position.set((Math.random()-0.5)*16, h/2, (Math.random()-0.5)*16);
-    clampYard(cube);
-    tries++;
-    if (tries>80) break;
-  } while(detectCollision(cube));
+  let cube = new THREE.Mesh(
+    new THREE.BoxGeometry(w,h,d),
+    createCubeFaceTextures(Array(6).fill(text), color, 256, 256, {w,h,d})
+  );
+  cube.userData = { baseColor: parseInt(color.replace('#',''),16), prevPos: new THREE.Vector3(), inTrailer: false };
+  
+  cube.userData.texts = Array(6).fill(text);
+
+  // spawn outside trailer & avoid overlapping
+  const cubeSize = {width: w, height: h, depth: d};
+  cube.position.copy(getRandomSpawnPositionOutsideTrailer(cubeSize));
 
   scene.add(cube);
   cubes.push(cube);
@@ -592,6 +1523,23 @@ renderer.domElement.addEventListener('click', e=>{
   }
 });
 
+renderer.domElement.addEventListener('click', e => {
+  raycaster.setFromCamera(mouse, camera);
+  const cubeHits = raycaster.intersectObjects(cubes, false);
+
+  // If clicked on cube, do nothing here
+  if (cubeHits.length === 0) {
+    // Clicked empty space — hide active cube arrows
+    clearActiveCube();
+    
+    // ✅ Also hide groups panel if it's shown
+    if (groupsList.classList.contains('show')) {
+      groupsList.classList.remove('show');
+    }
+  }
+});
+
+
 /* RENDER LOOP */
 function animate(){
   requestAnimationFrame(animate);
@@ -607,4 +1555,4 @@ window.addEventListener('resize', ()=>{
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 </script>
-''', height=500)
+''', height=600,scrolling=False)
