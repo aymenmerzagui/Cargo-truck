@@ -471,14 +471,19 @@ function moveWithSweep(cube, targetPos) {
   }
 
   const geom = cube.geometry.parameters;
+  const halfH = (geom.height || geom.h || 1) / 2;
+  const halfW = (geom.width || geom.w || 1) / 2;
+  const halfD = (geom.depth || geom.d || geom.width || 1) / 2;
+
   const smallestDim = Math.min(geom.width || geom.w || 1, geom.height || geom.h || 1, geom.depth || geom.d || 1);
   const stepSize = Math.min(0.25, Math.max(0.08, smallestDim * 0.25));
   const steps = Math.max(1, Math.ceil(dist / stepSize));
 
   const step = delta.clone().divideScalar(steps);
   let cur = prev.clone();
+  let lastSafe = prev.clone();
 
-  // We'll need world trailer center for opening tests; compute once per call (cheap)
+  // Compute trailer world center once
   let trailerWorldCenter = null;
   if (trailerInterior) {
     trailerInterior.updateWorldMatrix(true, false);
@@ -491,18 +496,11 @@ function moveWithSweep(cube, targetPos) {
     cube.position.x = cur.x;
     cube.position.z = cur.z;
 
-    // half extents
-    const halfH = (geom.height || geom.h || 1) / 2;
-    const halfD = (geom.depth || geom.d || geom.width || 1) / 2;
-
-    // --- Opening intersection test (robust) ---
+    // --- Opening intersection test ---
     let isTouchingOpening = false;
     if (trailerWorldCenter) {
-      // back opening plane z (open side) is trailerWorldCenter.z - T_D/2 (your trailer was open on negative Z)
       const backZ = trailerWorldCenter.z - (T_D / 2);
-
-      // create a thin opening slab centered at backZ
-      const OPEN_THICKNESS = 0.22; // small thickness to catch overlaps (tweak if needed)
+      const OPEN_THICKNESS = 0.22;
       const openingMin = new THREE.Vector3(
         trailerWorldCenter.x - T_W / 2,
         trailerWorldCenter.y - T_H / 2,
@@ -514,41 +512,56 @@ function moveWithSweep(cube, targetPos) {
         backZ + OPEN_THICKNESS / 2
       );
       const openingBox = new THREE.Box3(openingMin, openingMax);
-
-      // compute cube AABB in world coords
       const cubeBox = new THREE.Box3().setFromObject(cube);
+      const movingInto = (prev.z - cur.z) > 0.0001;
 
-      // motion direction: are we moving into the trailer (toward negative Z)?
-      const movingInto = (prev.z - cur.z) > 0.0001; // true if z decreases this step
-
-      // touch if AABB intersects the opening slab and we are moving into the trailer
       if (cubeBox.intersectsBox(openingBox) && movingInto) {
         isTouchingOpening = true;
       }
     }
 
-    // --- If touching opening while moving in, snap to trailer floor ---
     if (isTouchingOpening) {
-      const floorY = FLOOR_T;            // trailer floor top surface y
-      cube.position.y = floorY + halfH;
+      // Snap to trailer floor
+      cube.position.y = FLOOR_T + halfH;
     } else {
-      // --- Normal downward raycast to floors/platforms/other cubes ---
-      const rayOrigin = cube.position.clone();
-      // start higher so tall cubes / edge cases are covered
-      rayOrigin.y += Math.max(2, halfH + 0.5);
-      const downRay = new THREE.Raycaster(rayOrigin, new THREE.Vector3(0, -1, 0));
+      // --- Try stacking directly on another cube ---
+      let stacked = false;
+      for (let other of cubes) {
+        if (other === cube) continue;
 
-      const surfaces = floorColliders.concat(cubes.filter(c => c !== cube));
-      const intersects = downRay.intersectObjects(surfaces, true);
+        const b = new THREE.Box3().setFromObject(other);
 
-      if (intersects.length > 0) {
-        // use highest hit under the cube
-        let maxY = -Infinity;
-        intersects.forEach(hit => { if (hit.point.y > maxY) maxY = hit.point.y; });
-        cube.position.y = maxY + halfH;
-      } else {
-        // fallback to yard ground
-        cube.position.y = halfH;
+        const aMinX = cur.x - halfW;
+        const aMaxX = cur.x + halfW;
+        const aMinZ = cur.z - halfD;
+        const aMaxZ = cur.z + halfD;
+
+        const overlapX = (aMinX < b.max.x) && (aMaxX > b.min.x);
+        const overlapZ = (aMinZ < b.max.z) && (aMaxZ > b.min.z);
+        if (!overlapX || !overlapZ) continue;
+
+        const otherTop = b.max.y;
+        cube.position.y = otherTop + halfH;
+        stacked = true;
+        break;
+      }
+
+      if (!stacked) {
+        // --- Raycast fallback: drop onto floor or cubes ---
+        const rayOrigin = cube.position.clone();
+        rayOrigin.y += Math.max(2, halfH + 0.5);
+        const downRay = new THREE.Raycaster(rayOrigin, new THREE.Vector3(0, -1, 0));
+
+        const surfaces = floorColliders.concat(cubes.filter(c => c !== cube));
+        const intersects = downRay.intersectObjects(surfaces, true);
+
+        if (intersects.length > 0) {
+          let maxY = -Infinity;
+          intersects.forEach(hit => { if (hit.point.y > maxY) maxY = hit.point.y; });
+          cube.position.y = maxY + halfH;
+        } else {
+          cube.position.y = halfH;
+        }
       }
     }
 
@@ -556,37 +569,28 @@ function moveWithSweep(cube, targetPos) {
     if (trailerVisible && trailerInterior && isInsideTrailerByPos(cube)) clampInsideTrailer(cube);
     else clampYard(cube);
 
-    // --- Collision detection: revert if blocked ---
+    // --- Collision check (but allow stacking touch) ---
     if (detectCollision(cube)) {
-      cube.position.copy(prev);
+      cube.position.copy(lastSafe);
       return false;
     }
+
+    lastSafe.copy(cube.position);
   }
 
-  // movement accepted
   cube.userData.prevPos = cube.position.clone();
   return true;
 }
+
 
 dragControls.addEventListener('drag', e => {
   const cube = e.object;
   const targetPos = cube.position.clone();
 
-  // move in X/Z using existing sweep (this also sets Y via raycast fallback)
+  // move in X/Z using existing sweep (this also sets Y via the new stacking/raycast logic)
   moveWithSweep(cube, targetPos);
 
-  // half height of cube
-  const halfH = (cube.geometry.parameters.height || cube.geometry.parameters.h || 1) / 2;
-
-  // If near the trailer opening, snap up to trailer floor; otherwise return to grid level
-  const NEAR_THRESH = 0.8; // tweak this: bigger => detect earlier
-  if (trailerVisible && isNearOpening(cube, NEAR_THRESH)) {
-    // trailer floor top is at y = FLOOR_T
-    cube.position.y = FLOOR_T + halfH;
-  } else {
-    // outside -> grid level
-    cube.position.y = halfH;
-  }
+  // removed forced Y assignment — moveWithSweep already places/stacks the cube
 
   // clamp and collisions
   if (trailerVisible && isInsideTrailerByPos(cube)) clampInsideTrailer(cube);
@@ -596,6 +600,7 @@ dragControls.addEventListener('drag', e => {
     cube.position.copy(cube.userData.prevPos);
   }
 });
+
 
 
 
@@ -707,32 +712,47 @@ function updateStoredState(obj) {
  setTimeout(refreshDragControls, 0);
 }
 
-/* Collision with other cubes */
+/* Collision with other cubes - volumetric test (allows face-touching).
+   If cube.userData._stackState && lifted === true -> ignore cube–cube checks
+   (we already performed a clearance check before lifting). */
 function detectCollision(cube) {
-  // ensure world matrices are up-to-date (important when objects move)
+  // ensure world matrices are up-to-date
   scene.updateMatrixWorld(true);
 
   const a = new THREE.Box3().setFromObject(cube);
 
-  // Check cube–cube collisions
+  // tolerances
+  const EPS_XZ = 1e-5;  // very small tolerance for horizontal overlap
+  const EPS_Y  = 1e-3;  // slightly larger tolerance for vertical (stacking)
+
+  // cube–cube collisions
   const collideCubes = cubes.some(other => {
     if (other === cube) return false;
     const b = new THREE.Box3().setFromObject(other);
-    return a.intersectsBox(b);
+
+    const overlapX = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+    const overlapY = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+    const overlapZ = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+
+    // allow "touching" on Y (stacking) without counting as collision
+    return (overlapX > EPS_XZ && overlapZ > EPS_XZ && overlapY > EPS_Y);
   });
 
-  // Check cube–wall collisions, but IGNORE floor-like colliders
+  // cube–wall collisions (ignore floor colliders)
   const collideWalls = wallColliders
-    .filter(collider => !floorColliders.includes(collider)) // <-- ignore floors
+    .filter(collider => !floorColliders.includes(collider))
     .some(collider => {
       const b = new THREE.Box3().setFromObject(collider);
-      return a.intersectsBox(b);
+
+      const overlapX = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+      const overlapY = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+      const overlapZ = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+
+      return (overlapX > EPS_XZ && overlapY > EPS_Y && overlapZ > EPS_XZ);
     });
 
   return collideCubes || collideWalls;
 }
-
-
 
 
 /* Arrows */
